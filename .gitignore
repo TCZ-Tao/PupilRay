@@ -4,6 +4,7 @@ target/
 .vscode/
 *.ptx
 data/*
+test_data/*
 imgui.ini
 static.h
 
