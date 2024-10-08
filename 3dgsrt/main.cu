@@ -182,18 +182,23 @@ extern "C" __global__ void __raygen__main() {
                 optix_launch_params.config.scale_factor;
             float3 scale_inv = 1.f / scale;
             float4 q = data->geo.threedgs.rotations[particle_index];
-            float3 r0 = make_float3( //不知道是转置还是不转的,试试
-                1.f - 2.f * q.y * q.y - 2.f * q.z * q.z,
-                2.f * q.x * q.y - 2.f * q.z * q.w,
-                2.f * q.x * q.z + 2.f * q.y * q.w);
+            float  qx        = q.y;
+            float  qy        = q.z;
+            float  qz        = q.w;
+            float  qw        = q.x;
+            float3 r0 = make_float3(
+                1.f - 2.f * qy * qy - 2.f * qz * qz,
+                2.f * qx * qy - 2.f * qz * qw,
+                2.f * qx * qz + 2.f * qy * qw);
             float3 r1 = make_float3(
-                2.f * q.x * q.y + 2.f * q.z * q.w,
-                1.f - 2.f * q.x * q.x - 2.f * q.z * q.z,
-                2.f * q.y * q.z - 2.f * q.x * q.w);
+                2.f * qx * qy + 2.f * qz * qw,
+                1.f - 2.f * qx * qx - 2.f * qz * qz,
+                2.f * qy * qz - 2.f * qx * qw);
             float3 r2 = make_float3(
-                2.f * q.x * q.z - 2.f * q.y * q.w,
-                2.f * q.y * q.z + 2.f * q.x * q.w,
-                1.f - 2.f * q.x * q.x - 2.f * q.y * q.y);
+                2.f * qx * qz - 2.f * qy * qw,
+                2.f * qy * qz + 2.f * qx * qw,
+                1.f - 2.f * qx * qx - 2.f * qy * qy);
+
             float3 rt0 = make_float3(r0.x, r1.x, r2.x);
             float3 rt1 = make_float3(r0.y, r1.y, r2.y);
             float3 rt2 = make_float3(r0.z, r1.z, r2.z);
