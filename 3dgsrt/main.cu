@@ -221,32 +221,35 @@ extern "C" __global__ void __raygen__main() {
             float  t_max_res = (-dot(o_g, d_g)) / dot(d_g, d_g);
             float3 pt  = ray_origin + ray_direction * t_max_res;
 
-            //R^T * S-1 * S-1
-            float3 t0 = make_float3(rt0.x * scale_inv.x * scale_inv.x, 
-                rt0.x * scale_inv.y * scale_inv.y, 
-                rt0.x * scale_inv.z * scale_inv.z);
-            float3 t1 = make_float3(rt1.x * scale_inv.x * scale_inv.x, 
-                rt1.x * scale_inv.y * scale_inv.y, 
-                rt1.x * scale_inv.z * scale_inv.z);
-            float3 t2 = make_float3(rt2.x * scale_inv.x * scale_inv.x, 
-                rt2.x * scale_inv.y * scale_inv.y, 
-                rt2.x * scale_inv.z * scale_inv.z);
+            //R * S-1 * S-1
+            float3 t0 = make_float3(
+                r0.x * scale_inv.x * scale_inv.x, 
+                r0.x * scale_inv.y * scale_inv.y, 
+                r0.x * scale_inv.z * scale_inv.z);
+            float3 t1 = make_float3(
+                r1.x * scale_inv.x * scale_inv.x, 
+                r1.x * scale_inv.y * scale_inv.y, 
+                r1.x * scale_inv.z * scale_inv.z);
+            float3 t2 = make_float3(
+                r2.x * scale_inv.x * scale_inv.x, 
+                r2.x * scale_inv.y * scale_inv.y, 
+                r2.x * scale_inv.z * scale_inv.z);
 
-            // * R
+            // * R^T
             m0 = make_float4(
-                t0.x * r0.x + t0.y * r1.x + t0.z * r2.x,
-                t0.x * r0.y + t0.y * r1.y + t0.z * r2.y,
-                t0.x * r0.z + t0.y * r1.z + t0.z * r2.z,
+                t0.x * rt0.x + t0.y * rt1.x + t0.z * rt2.x,
+                t0.x * rt0.y + t0.y * rt1.y + t0.z * rt2.y,
+                t0.x * rt0.z + t0.y * rt1.z + t0.z * rt2.z,
                 0.f);
             m1 = make_float4(
-                t1.x * r0.x + t1.y * r1.x + t1.z * r2.x,
-                t1.x * r0.y + t1.y * r1.y + t1.z * r2.y,
-                t1.x * r0.z + t1.y * r1.z + t1.z * r2.z,
+                t1.x * rt0.x + t1.y * rt1.x + t1.z * rt2.x,
+                t1.x * rt0.y + t1.y * rt1.y + t1.z * rt2.y,
+                t1.x * rt0.z + t1.y * rt1.z + t1.z * rt2.z,
                 0.f);
             m2 = make_float4(
-                t2.x * r0.x + t2.y * r1.x + t2.z * r2.x,
-                t2.x * r0.y + t2.y * r1.y + t2.z * r2.y,
-                t2.x * r0.z + t2.y * r1.z + t2.z * r2.z,
+                t2.x * rt0.x + t2.y * rt1.x + t2.z * rt2.x,
+                t2.x * rt0.y + t2.y * rt1.y + t2.z * rt2.y,
+                t2.x * rt0.z + t2.y * rt1.z + t2.z * rt2.z,
                 0.f);
 
             m0 = make_float4(scale_inv.x * scale_inv.x, 0, 0, 0);
