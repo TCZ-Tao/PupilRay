@@ -15,7 +15,7 @@ struct HitGroupData {
 
 struct OptixLaunchParams {
     struct {
-        //unsigned int max_depth;
+        unsigned int max_depth;
         float scale_factor;
         bool accumulated_flag;
 

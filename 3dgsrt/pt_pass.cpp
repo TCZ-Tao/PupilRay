@@ -19,7 +19,7 @@ extern uint32_t g_window_h;
 }// namespace Pupil
 
 namespace {
-//int m_max_depth;
+    int m_max_depth;
     float m_scale_factor;
     bool m_accumulated_flag;
 
@@ -40,7 +40,7 @@ PTPass::PTPass(std::string_view name) noexcept
 void PTPass::OnRun() noexcept {
     if (m_dirty) {
         m_optix_launch_params.camera.SetData(m_world_camera->GetCudaMemory());
-        //m_optix_launch_params.config.max_depth = m_max_depth;
+        m_optix_launch_params.config.max_depth = m_max_depth;
         m_optix_launch_params.config.scale_factor = m_scale_factor;
         m_optix_launch_params.config.accumulated_flag = m_accumulated_flag;
         m_optix_launch_params.sample_cnt = 0;
@@ -138,11 +138,11 @@ void PTPass::SetScene(world::World *world) noexcept {
 
     m_optix_launch_params.config.frame.width = world->scene->sensor.film.w;
     m_optix_launch_params.config.frame.height = world->scene->sensor.film.h;
-    //m_optix_launch_params.config.max_depth = world->scene->integrator.max_depth;
+    m_optix_launch_params.config.max_depth = world->scene->integrator.max_depth;
     m_optix_launch_params.config.scale_factor     = 1.f;
     m_optix_launch_params.config.accumulated_flag = true;
 
-    //m_max_depth = m_optix_launch_params.config.max_depth;
+    m_max_depth = m_optix_launch_params.config.max_depth;
     m_scale_factor = m_optix_launch_params.config.scale_factor;
     m_accumulated_flag = m_optix_launch_params.config.accumulated_flag;
 
@@ -271,11 +271,11 @@ void PTPass::BindingEventCallback() noexcept {
 void PTPass::Inspector() noexcept {
     Pass::Inspector();
     ImGui::Text("sample count: %d", m_optix_launch_params.sample_cnt + 1);
-    //ImGui::InputInt("max trace depth", &m_max_depth);
-    //m_max_depth = clamp(m_max_depth, 1, 128);
-    //if (m_optix_launch_params.config.max_depth != m_max_depth) {
-    //    m_dirty = true;
-    //}
+    ImGui::InputInt("max trace depth", &m_max_depth);
+    m_max_depth = clamp(m_max_depth, 1, 128);
+    if (m_optix_launch_params.config.max_depth != m_max_depth) {
+        m_dirty = true;
+    }
 
     ImGui::InputFloat("scale factor", &m_scale_factor);
     m_scale_factor = clamp(m_scale_factor, 0.1f, 10.f);

@@ -9,6 +9,10 @@ add_executable(${target_name}
     pt_pass.h
     pt_pass.cpp
     type.h
+    json.hpp
+    stb_image.h
+    read_cameras.h
+    read_cameras.cpp
 )
 
 target_link_libraries(${target_name} PUBLIC ${pupil_framework_name})

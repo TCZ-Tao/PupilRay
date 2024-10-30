@@ -1,12 +1,12 @@
 #include <optix.h>
-#include "type.h"
 
 #include "optix/util.h"
-#include "render/geometry.h"
 #include "render/material/bsdf/bsdf.h"
 
 #include "cuda/random.h"
 #include "resource/3dgs/ply_loader.h"
+
+#include "type.h"
 
 using namespace Pupil;
 
@@ -27,6 +27,7 @@ struct HitInfo {
     optix::LocalGeometry geo;
     optix::material::Material::LocalBsdf bsdf;
     int emitter_index;
+    float t_hit;
 };
 
 struct PathPayloadRecord {
@@ -42,12 +43,12 @@ struct PathPayloadRecord {
     ThreedgsQueue queue;
 
     unsigned int depth;
-    bool done;
+    bool reach_bg;
 
     float test;
 };
 
-__forceinline__ __device__ float3 GetSHCoef(pt::HitGroupData* data,
+CUDA_INLINE CUDA_DEVICE float3 GetSHCoef(pt::HitGroupData* data,
     const unsigned int index_begin,
     const unsigned int index) { 
     const unsigned int sh_n = 16;
@@ -61,7 +62,7 @@ __forceinline__ __device__ float3 GetSHCoef(pt::HitGroupData* data,
                     data->geo.threedgs.shses[index_begin + index - 1 + sh_n * 2 + 1]);
     }
 }
-__forceinline__ __device__ float3 ComputeSH(pt::HitGroupData* data,
+CUDA_INLINE CUDA_DEVICE float3 ComputeSH(pt::HitGroupData* data,
     const unsigned int index_begin, const float x, const float y, const float z) {
     float3 c = GetSHCoef(data, index_begin, 0) * 0.28209479177387814f;
 
@@ -104,7 +105,7 @@ extern "C" __global__ void __raygen__main() {
     uint32_t u0, u1;
     optix::PackPointer(&record, u0, u1);
 
-    record.done = false;
+    record.reach_bg = false;
     record.depth = 0u;
     record.throughput = make_float3(1.f);
     record.radiance = make_float3(0.f);
@@ -131,165 +132,315 @@ extern "C" __global__ void __raygen__main() {
 
     optix_launch_params.albedo_buffer[pixel_index] = make_float3(0.f);
     optix_launch_params.normal_buffer[pixel_index] = make_float3(0.f);
-    optix_launch_params.accum_buffer[pixel_index] = make_float4(0.f);
     
     float t_min = 0.001f;
     float t_max = 1e16f; //t_scene_max?
 
-    //optixTrace(optix_launch_params.handle,
-    //           ray_origin, ray_direction,
-    //           t_min, t_max, 0.f,
-    //           255, OPTIX_RAY_FLAG_NONE,
-    //           0, 2, 0,
-    //           u0, u1);
-    //auto local_hit = record.hit;
 
-    //if (record.done) {
-    //    optix_launch_params.frame_buffer[pixel_index] = make_float4(1.f); // background
-    //} else {
-    //    optix_launch_params.frame_buffer[pixel_index] = 
-    //        make_float4(record.hit.geo.texcoord.x, record.hit.geo.texcoord.y, 
-    //            1.f - record.hit.geo.texcoord.x - record.hit.geo.texcoord.y, 1.f);
-    //}
+    // for test
+            //if (record.done) {
+            //    optix_launch_params.frame_buffer[pixel_index] = make_float4(record.env_radiance);
+            //} else {
+            //    optix_launch_params.frame_buffer[pixel_index] = 
+            //        make_float4(record.hit.geo.texcoord.x, record.hit.geo.texcoord.y, 
+            //            1.f - record.hit.geo.texcoord.x - record.hit.geo.texcoord.y, 1.f);
+            //}
+    int depth = 0;
+    bool reach_bg = false;
+    float3 ray_origin_next = ray_origin;
+    float3 ray_direction_next = ray_direction;
+    optix::BsdfSamplingRecord bsdf_sample_record_pre; // bsdf at ray begin
+    bool direct_light = false;
 
-    float  t_curr = t_min;
-    float3 radiance = make_float3(0.f);
-    float  transmittance = 1.f;
-    float  transmittance_min = 0.01f;
-
-    auto ray_count = 0u;
-
-    while (t_curr < t_max && !record.done && transmittance > transmittance_min) {
-        // reset kbuffer
-        record.queue.hit_count = 0;
-        for (int i = 0; i < PLY_3DGS_CHUNK_SIZE; ++i)
-            record.queue.hit_t[i] = t_max;
-
+    while (!reach_bg) {
+        // ===== trace common objects
         optixTrace(optix_launch_params.handle,
-            ray_origin, ray_direction,
-            t_curr, t_max, 0.f,
-            255, OPTIX_RAY_FLAG_CULL_BACK_FACING_TRIANGLES,
-            0, 2, 0,
-            u0, u1);
+                    ray_origin, ray_direction,
+                    t_min, t_max, 0.f,
+                    OptixVisibilityMask(optix::VISIBILITY_MASK_COMMON), 
+                    OPTIX_RAY_FLAG_NONE,
+                    0, 2, 0,
+                    u0, u1);
+        auto local_hit = record.hit;
+        auto throughput_old = record.throughput;
+        float3 direct_emission;
 
-        unsigned int hit_count = record.queue.hit_count;
-        const unsigned int queue_size = min(PLY_3DGS_CHUNK_SIZE, hit_count);
-        for (int i = 0; i < queue_size; ++i) {
-            const unsigned int particle_index = record.queue.hit_index[i];
-            pt::HitGroupData* data = static_cast<pt::HitGroupData*>(record.queue.sbts[i]);
-            // compute response
-            float3 scale = data->geo.threedgs.scales[particle_index] *
-                optix_launch_params.config.scale_factor;
-            float3 scale_inv = 1.f / scale;
-            float4 q = data->geo.threedgs.rotations[particle_index];
-            float  qx        = q.y;
-            float  qy        = q.z;
-            float  qz        = q.w;
-            float  qw        = q.x;
-            float3 r0 = make_float3(
-                1.f - 2.f * qy * qy - 2.f * qz * qz,
-                2.f * qx * qy - 2.f * qz * qw,
-                2.f * qx * qz + 2.f * qy * qw);
-            float3 r1 = make_float3(
-                2.f * qx * qy + 2.f * qz * qw,
-                1.f - 2.f * qx * qx - 2.f * qz * qz,
-                2.f * qy * qz - 2.f * qx * qw);
-            float3 r2 = make_float3(
-                2.f * qx * qz - 2.f * qy * qw,
-                2.f * qy * qz + 2.f * qx * qw,
-                1.f - 2.f * qx * qx - 2.f * qy * qy);
-
-            float3 rt0 = make_float3(r0.x, r1.x, r2.x);
-            float3 rt1 = make_float3(r0.y, r1.y, r2.y);
-            float3 rt2 = make_float3(r0.z, r1.z, r2.z);
-            // S^{-1}*R^T
-            float4 m0 = make_float4( 
-                scale_inv.x * rt0.x, scale_inv.x * rt0.y, scale_inv.x * rt0.z, 0.f);
-            float4 m1 = make_float4( 
-                scale_inv.y * rt1.x, scale_inv.y * rt1.y, scale_inv.y * rt1.z, 0.f);
-            float4 m2 = make_float4( 
-                scale_inv.z * rt2.x, scale_inv.z * rt2.y, scale_inv.z * rt2.z, 0.f);
-
-            float3 pos_local = data->geo.threedgs.pt_positions[particle_index];
-            //todo 还没思路怎么把高斯instance应用localtoworld的transform
-            //思路1：把transfrom矩阵看成一个整体推算
-            //思路2：在Geometry::Threedgs里面把SRT矩阵也加进去
-            float3 pos = pos_local;
-
-            float3 o_g = optix_impl::optixTransformVector(m0, m1, m2, ray_origin - pos);
-            float3 d_g = optix_impl::optixTransformVector(m0, m1, m2, ray_direction);
-            float  t_max_res = (-dot(o_g, d_g)) / dot(d_g, d_g);
-            float3 pt  = ray_origin + ray_direction * t_max_res;
-
-            //R * S-1 * S-1
-            float3 t0 = make_float3(
-                r0.x * scale_inv.x * scale_inv.x, 
-                r0.x * scale_inv.y * scale_inv.y, 
-                r0.x * scale_inv.z * scale_inv.z);
-            float3 t1 = make_float3(
-                r1.x * scale_inv.x * scale_inv.x, 
-                r1.x * scale_inv.y * scale_inv.y, 
-                r1.x * scale_inv.z * scale_inv.z);
-            float3 t2 = make_float3(
-                r2.x * scale_inv.x * scale_inv.x, 
-                r2.x * scale_inv.y * scale_inv.y, 
-                r2.x * scale_inv.z * scale_inv.z);
-
-            // * R^T
-            m0 = make_float4(
-                t0.x * rt0.x + t0.y * rt1.x + t0.z * rt2.x,
-                t0.x * rt0.y + t0.y * rt1.y + t0.z * rt2.y,
-                t0.x * rt0.z + t0.y * rt1.z + t0.z * rt2.z,
-                0.f);
-            m1 = make_float4(
-                t1.x * rt0.x + t1.y * rt1.x + t1.z * rt2.x,
-                t1.x * rt0.y + t1.y * rt1.y + t1.z * rt2.y,
-                t1.x * rt0.z + t1.y * rt1.z + t1.z * rt2.z,
-                0.f);
-            m2 = make_float4(
-                t2.x * rt0.x + t2.y * rt1.x + t2.z * rt2.x,
-                t2.x * rt0.y + t2.y * rt1.y + t2.z * rt2.y,
-                t2.x * rt0.z + t2.y * rt1.z + t2.z * rt2.z,
-                0.f);
-
-            m0 = make_float4(scale_inv.x * scale_inv.x, 0, 0, 0);
-            m1 = make_float4(0, scale_inv.y * scale_inv.y, 0, 0);
-            m2 = make_float4(0, 0, scale_inv.z * scale_inv.z, 0);
-            
-            float3 x_minus_mu = pt - pos;
-            float3 temp = optix_impl::optixTransformVector(m0, m1, m2, x_minus_mu);
-            float  power = -dot(x_minus_mu, temp);
-            float alpha_hit = min(0.99f, 
-                expf(power) * data->geo.threedgs.opacities[particle_index]);
-
-            if (alpha_hit > PLY_3DGS_ALPHA_MIN) {
-                unsigned int index_begin = particle_index * PLY_3DGS_NUM_SHS;
-                float3 radiance_hit = ComputeSH(data, index_begin, 
-                    ray_direction.x, ray_direction.y, ray_direction.z);
-                radiance += transmittance * alpha_hit * radiance_hit;
-                transmittance *= (1 - alpha_hit);
+        optix::BsdfSamplingRecord bsdf_sample_record;
+        if (!record.reach_bg) {
+            // ===== hit emitter
+            if (local_hit.emitter_index >= 0 && !direct_light) {
+                auto& emitter = optix_launch_params.emitters.areas[local_hit.emitter_index];
+                direct_emission = emitter.GetRadiance(local_hit.geo.texcoord);
+                direct_light = true;
+                //break;
             }
-            //测试每个包围体第一个顶点位置
-            //uint3 idx = data->geo.threedgs.indices[particle_index*20];
-            //pos = data->geo.threedgs.positions[idx.x];
+
+            // ===== direct light sampling
+            auto& emitter = optix_launch_params.emitters.SelectOneEmiiter(record.random.Next());
+            optix::EmitterSampleRecord emitter_sample_record;
+            emitter.SampleDirect(emitter_sample_record, local_hit.geo, record.random.Next2());
+
+            bool occluded = optix::Emitter::TraceShadowRay(
+                optix_launch_params.handle,
+                local_hit.geo.position,
+                emitter_sample_record.wi,
+                0.0001f,
+                emitter_sample_record.distance - 0.0001f
+            );
+            if (!occluded) {
+                optix::BsdfSamplingRecord eval_record;
+                eval_record.wi = optix::ToLocal(emitter_sample_record.wi, local_hit.geo.normal);
+                eval_record.wo = optix::ToLocal(-ray_direction, local_hit.geo.normal);
+                eval_record.sampler = &record.random;
+                record.hit.bsdf.Eval(eval_record);
+                float3 f = eval_record.f;
+                float  pdf = eval_record.pdf;
+                if (!optix::IsZero(f * emitter_sample_record.pdf)) {
+                    float NoL = dot(local_hit.geo.normal, emitter_sample_record.wi);
+                    if (NoL > 0.f) {
+                        float mis = emitter_sample_record.is_delta ? 
+                            1.f : optix::MISWeight(emitter_sample_record.pdf, pdf);
+                        emitter_sample_record.pdf *= emitter.select_probability;
+                        record.radiance += record.throughput * emitter_sample_record.radiance 
+                            * f * NoL * mis / emitter_sample_record.pdf;
+                        // 目前高斯不影响光照
+                    }
+                }
+            }
+
+            // ===== bsdf sampling
+            bsdf_sample_record.wo = optix::ToLocal(-ray_direction, local_hit.geo.normal);
+            bsdf_sample_record.sampler = &record.random;
+            record.hit.bsdf.Sample(bsdf_sample_record);
+
+            if ( !direct_light &&
+                (optix::IsZero(bsdf_sample_record.f * abs(bsdf_sample_record.wi.z)) 
+                || optix::IsZero(bsdf_sample_record.pdf)))
+                break;
             
-            //测试中心点是否在包围体中心
-            //float t_close = dot(ray_direction, pos - ray_origin) / dot(ray_direction, ray_direction);
-            //float3 p_close  = ray_origin + ray_direction * t_close;
-            //float  dis      = sqrt(dot(pos - p_close, pos - p_close)) * 10.f;
+            record.throughput *= 
+                bsdf_sample_record.f * abs(bsdf_sample_record.wi.z) / bsdf_sample_record.pdf;
 
-            //radiance += max(1.f - dis, 0.f);
-            //break;
+            // next ray
+            ray_origin_next = record.hit.geo.position;
+            ray_direction_next = optix::ToWorld(bsdf_sample_record.wi, local_hit.geo.normal);
         }
-        // visualize test
-        //optix_launch_params.albedo_buffer[pixel_index] = 
-        //    make_float3((float)hit_count/PLY_3DGS_CHUNK_SIZE);
-        ++ray_count;
+        // avoid being changed in gaussian tracing
+        auto env_radiance = record.env_radiance;
+        auto env_pdf      = record.env_pdf;
+        reach_bg = record.reach_bg;
 
-        // if not enough, it's tmax. if the queue is full, use the furthest one
-        t_curr = record.queue.hit_t[PLY_3DGS_CHUNK_SIZE-1];
-        //break;
+        // ===== trace gaussians
+        float3 radiance_gaussian = make_float3(0.f);
+        float  transmittance = 1.f;
+        float  transmittance_min = 0.01f;
+        {
+            float  t_curr = t_min;
+            float  t_curr_max = record.hit.t_hit;
+
+            auto ray_count = 0u;
+
+            record.reach_bg = false;
+
+            while (t_curr < t_curr_max && !record.reach_bg && transmittance > transmittance_min) {
+                // reset kbuffer
+                record.queue.hit_count = 0;
+                for (int i = 0; i < PLY_3DGS_CHUNK_SIZE; ++i)
+                    record.queue.hit_t[i] = t_curr_max;
+
+                optixTrace(optix_launch_params.handle,
+                    ray_origin, ray_direction,
+                    t_curr, t_curr_max, 0.f,
+                    OptixVisibilityMask(optix::VISIBILITY_MASK_GAUSSIAN), 
+                    OPTIX_RAY_FLAG_CULL_BACK_FACING_TRIANGLES,
+                    0, 2, 0,
+                    u0, u1);
+
+                unsigned int hit_count = record.queue.hit_count;
+                const unsigned int queue_size = min(PLY_3DGS_CHUNK_SIZE, hit_count);
+                for (int i = 0; i < queue_size; ++i) {
+                    const unsigned int particle_index = record.queue.hit_index[i];
+                    pt::HitGroupData* data = static_cast<pt::HitGroupData*>(record.queue.sbts[i]);
+                    // compute response
+                    float3 scale = data->geo.threedgs.scales[particle_index] *
+                        optix_launch_params.config.scale_factor;
+                    float3 scale_inv = 1.f / scale;
+                    float4 q = data->geo.threedgs.rotations[particle_index];
+                    float  qx        = q.y;
+                    float  qy        = q.z;
+                    float  qz        = q.w;
+                    float  qw        = q.x;
+                    float3 r0 = make_float3(
+                        1.f - 2.f * qy * qy - 2.f * qz * qz,
+                        2.f * qx * qy - 2.f * qz * qw,
+                        2.f * qx * qz + 2.f * qy * qw);
+                    float3 r1 = make_float3(
+                        2.f * qx * qy + 2.f * qz * qw,
+                        1.f - 2.f * qx * qx - 2.f * qz * qz,
+                        2.f * qy * qz - 2.f * qx * qw);
+                    float3 r2 = make_float3(
+                        2.f * qx * qz - 2.f * qy * qw,
+                        2.f * qy * qz + 2.f * qx * qw,
+                        1.f - 2.f * qx * qx - 2.f * qy * qy);
+
+                    float3 rt0 = make_float3(r0.x, r1.x, r2.x);
+                    float3 rt1 = make_float3(r0.y, r1.y, r2.y);
+                    float3 rt2 = make_float3(r0.z, r1.z, r2.z);
+                    // S^{-1}*R^T
+                    float4 m0 = make_float4( 
+                        scale_inv.x * rt0.x, scale_inv.x * rt0.y, scale_inv.x * rt0.z, 0.f);
+                    float4 m1 = make_float4( 
+                        scale_inv.y * rt1.x, scale_inv.y * rt1.y, scale_inv.y * rt1.z, 0.f);
+                    float4 m2 = make_float4( 
+                        scale_inv.z * rt2.x, scale_inv.z * rt2.y, scale_inv.z * rt2.z, 0.f);
+
+                    float3 pos_local = data->geo.threedgs.pt_positions[particle_index];
+                    //todo 还没思路怎么把高斯instance应用localtoworld的transform
+                    //思路1：把transfrom矩阵看成一个整体推算
+                    //思路2：在Geometry::Threedgs里面把SRT矩阵也加进去
+                    float3 pos = pos_local;
+
+                    float3 o_g = optix_impl::optixTransformVector(m0, m1, m2, ray_origin - pos);
+                    float3 d_g = optix_impl::optixTransformVector(m0, m1, m2, ray_direction);
+                    float  t_max_res = (-dot(o_g, d_g)) / dot(d_g, d_g);
+                    float3 pt  = ray_origin + ray_direction * t_max_res;
+
+                    //R * S-1 * S-1
+                    float3 t0 = make_float3(
+                        r0.x * scale_inv.x * scale_inv.x, 
+                        r0.x * scale_inv.y * scale_inv.y, 
+                        r0.x * scale_inv.z * scale_inv.z);
+                    float3 t1 = make_float3(
+                        r1.x * scale_inv.x * scale_inv.x, 
+                        r1.x * scale_inv.y * scale_inv.y, 
+                        r1.x * scale_inv.z * scale_inv.z);
+                    float3 t2 = make_float3(
+                        r2.x * scale_inv.x * scale_inv.x, 
+                        r2.x * scale_inv.y * scale_inv.y, 
+                        r2.x * scale_inv.z * scale_inv.z);
+
+                    // * R^T
+                    m0 = make_float4(
+                        t0.x * rt0.x + t0.y * rt1.x + t0.z * rt2.x,
+                        t0.x * rt0.y + t0.y * rt1.y + t0.z * rt2.y,
+                        t0.x * rt0.z + t0.y * rt1.z + t0.z * rt2.z,
+                        0.f);
+                    m1 = make_float4(
+                        t1.x * rt0.x + t1.y * rt1.x + t1.z * rt2.x,
+                        t1.x * rt0.y + t1.y * rt1.y + t1.z * rt2.y,
+                        t1.x * rt0.z + t1.y * rt1.z + t1.z * rt2.z,
+                        0.f);
+                    m2 = make_float4(
+                        t2.x * rt0.x + t2.y * rt1.x + t2.z * rt2.x,
+                        t2.x * rt0.y + t2.y * rt1.y + t2.z * rt2.y,
+                        t2.x * rt0.z + t2.y * rt1.z + t2.z * rt2.z,
+                        0.f);
+
+                    m0 = make_float4(scale_inv.x * scale_inv.x, 0, 0, 0);
+                    m1 = make_float4(0, scale_inv.y * scale_inv.y, 0, 0);
+                    m2 = make_float4(0, 0, scale_inv.z * scale_inv.z, 0);
+            
+                    float3 x_minus_mu = pt - pos;
+                    float3 temp = optix_impl::optixTransformVector(m0, m1, m2, x_minus_mu);
+                    float  power = -dot(x_minus_mu, temp);
+                    float alpha_hit = min(0.99f, 
+                        expf(power) * data->geo.threedgs.opacities[particle_index]);
+
+                    if (alpha_hit > PLY_3DGS_ALPHA_MIN) {
+                        unsigned int index_begin = particle_index * PLY_3DGS_NUM_SHS;
+                        float3 radiance_hit = ComputeSH(data, index_begin, 
+                            ray_direction.x, ray_direction.y, ray_direction.z);
+                        radiance_gaussian += transmittance * alpha_hit * radiance_hit;
+                        transmittance *= (1 - alpha_hit);
+                    }
+                    //测试每个包围体第一个顶点位置
+                    //uint3 idx = data->geo.threedgs.indices[particle_index*20];
+                    //pos = data->geo.threedgs.positions[idx.x];
+            
+                    //测试中心点是否在包围体中心
+                    //float t_close = dot(ray_direction, pos - ray_origin) / dot(ray_direction, ray_direction);
+                    //float3 p_close  = ray_origin + ray_direction * t_close;
+                    //float  dis      = sqrt(dot(pos - p_close, pos - p_close)) * 10.f;
+
+                    //radiance += max(1.f - dis, 0.f);
+                    //break;
+                }
+
+                // visualize test
+                //optix_launch_params.albedo_buffer[pixel_index] = 
+                //    make_float3((float)hit_count/PLY_3DGS_CHUNK_SIZE);
+                ++ray_count;
+
+                // if not enough, it's tmax. if the queue is full, use the furthest one
+                t_curr = record.queue.hit_t[PLY_3DGS_CHUNK_SIZE-1];
+                //break;
+            } //while
+        }
+
+        if (transmittance == transmittance_min) transmittance = 0.f;
+
+        if (direct_light) {
+            record.radiance += direct_emission * transmittance;
+            break;
+        }
+
+        if (!optix::IsZero(radiance_gaussian))
+            record.radiance += throughput_old * radiance_gaussian; 
+            // lerp by transmittance?
+
+        // environment light
+        if (reach_bg) {
+            float mis = optix::MISWeight(bsdf_sample_record_pre.pdf, env_pdf);
+            record.env_radiance = env_radiance * 
+                (optix::IsZero(bsdf_sample_record_pre.pdf) ? 
+                    make_float3(1.f) : (record.throughput * mis))
+                * transmittance;
+            break;
+        }
+
+        // hit an emitter object
+        if (local_hit.emitter_index >= 0) {
+            auto& emitter = optix_launch_params.emitters.areas[local_hit.emitter_index];
+            optix::EmitEvalRecord emit_record;
+            emitter.Eval(emit_record, local_hit.geo, ray_origin);
+            if (!optix::IsZero(emit_record.pdf)) {
+                float mis = bsdf_sample_record_pre.sampled_type & optix::EBsdfLobeType::Delta ?
+                    1.f : 
+                    optix::MISWeight(bsdf_sample_record_pre.pdf, 
+                        emit_record.pdf * emitter.select_probability);
+                record.radiance += record.throughput * emit_record.radiance * mis
+                    * transmittance;
+            }
+        }
+
+        // terminate
+        ++depth;
+        if (depth >= optix_launch_params.config.max_depth) break;
+
+        float rr = depth > 2 ? 0.95f : 1.f;
+        record.throughput /= rr;
+        if (record.random.Next() > rr) break;
+
+        // next
+        ray_origin = ray_origin_next;
+        ray_direction = ray_direction_next;
+        bsdf_sample_record_pre = bsdf_sample_record;
+
+        // reset
+        record.reach_bg = false;
     }
+
+    record.radiance += record.env_radiance;
+    // accumulate multiple samples
+    if (optix_launch_params.config.accumulated_flag && optix_launch_params.sample_cnt > 0) {
+        const float t = 1.f / (optix_launch_params.sample_cnt + 1.f);
+        const float3 pre = make_float3(optix_launch_params.accum_buffer[pixel_index]);
+        record.radiance  = lerp(pre, record.radiance, t);
+    }
+    optix_launch_params.accum_buffer[pixel_index] = make_float4(record.radiance, 1.f);
+    optix_launch_params.frame_buffer[pixel_index] = make_float4(record.radiance, 1.f);
+
+    /*
     //if (t_curr == t_max) radiance = make_float3(1, 0, 0);
     if (t_curr != t_max)
         optix_launch_params.normal_buffer[pixel_index] = make_float3(min(t_curr/10.f, 1.f));
@@ -297,6 +448,7 @@ extern "C" __global__ void __raygen__main() {
     optix_launch_params.albedo_buffer[pixel_index] = make_float3(min((float)ray_count/100, 1.f));
 
     optix_launch_params.frame_buffer[pixel_index] = make_float4(radiance, 1.f);
+    */
 }
 
 extern "C" __global__ void __miss__default() {
@@ -314,9 +466,10 @@ extern "C" __global__ void __miss__default() {
         record->env_radiance = emit_record.radiance;
         record->env_pdf = emit_record.pdf;
     } else {
-        record->env_radiance = make_float3(0.f);
+        // 不应该到这里，场景里至少写一个ConstantEnvEmitter
     }
-    record->done = true;
+    record->hit.t_hit = optixGetRayTmax();
+    record->reach_bg = true;
 }
 extern "C" __global__ void __miss__shadow() {
     // optixSetPayload_0(0u);
@@ -330,6 +483,8 @@ __device__ __forceinline__ void ClosestHit() {
     const auto ray_o = optixGetWorldRayOrigin();
 
     sbt_data->geo.GetHitLocalGeometry(record->hit.geo, ray_dir, sbt_data->mat.twosided);
+    record->hit.t_hit = optixGetRayTmax();
+
     if (sbt_data->emitter_index_offset >= 0) {
         record->hit.emitter_index = sbt_data->emitter_index_offset + optixGetPrimitiveIndex();
     } else {
