@@ -4,6 +4,8 @@
 #include "render/material/bsdf/bsdf.h"
 
 #include "cuda/random.h"
+#include "cuda/matrix.h"
+
 #include "resource/3dgs/ply_loader.h"
 
 #include "type.h"
@@ -91,6 +93,22 @@ CUDA_INLINE CUDA_DEVICE float3 ComputeSH(pt::HitGroupData* data,
     c += 0.5f;
     if (c.x < 0.f) c.x = 0.f;
     return c;
+}
+
+// quaternion vector to rotation matrix
+CUDA_INLINE CUDA_DEVICE void quat2Rot(const float4 q, mat3x3& R) {
+    float r = q.x;
+    float x = q.y;
+    float y = q.z;
+    float z = q.w;
+    R.r0 = make_float3(1.f - 2.f * (y * y - z * z), 2.f * (x * y - z * r), 2.f * (x * z + y * r));
+    R.r1 = make_float3(2.f * (x * y + z * r), 1.f - 2.f * (x * x + z * z), 2.f * (y * z - x * r));
+    R.r2 = make_float3(2.f * (x * z - y * r), 2.f * (y * z + x * r), 1.f - 2.f * (x * x + y * y));
+}
+
+
+CUDA_INLINE CUDA_DEVICE void computeCov2D(const float3 scale, const float4 rot){
+
 }
 
 extern "C" __global__ void __raygen__main() {
@@ -203,7 +221,7 @@ extern "C" __global__ void __raygen__main() {
                         emitter_sample_record.pdf *= emitter.select_probability;
                         record.radiance += record.throughput * emitter_sample_record.radiance 
                             * f * NoL * mis / emitter_sample_record.pdf;
-                        // 目前高斯不影响光照
+                        // 目前高斯不影响光源的光照
                     }
                 }
             }
@@ -261,88 +279,50 @@ extern "C" __global__ void __raygen__main() {
                 for (int i = 0; i < queue_size; ++i) {
                     const unsigned int particle_index = record.queue.hit_index[i];
                     pt::HitGroupData* data = static_cast<pt::HitGroupData*>(record.queue.sbts[i]);
-                    // compute response
-                    float3 scale = data->geo.threedgs.scales[particle_index] *
-                        optix_launch_params.config.scale_factor;
-                    float3 scale_inv = 1.f / scale;
-                    float4 q = data->geo.threedgs.rotations[particle_index];
-                    float  qx        = q.y;
-                    float  qy        = q.z;
-                    float  qz        = q.w;
-                    float  qw        = q.x;
-                    float3 r0 = make_float3(
-                        1.f - 2.f * qy * qy - 2.f * qz * qz,
-                        2.f * qx * qy - 2.f * qz * qw,
-                        2.f * qx * qz + 2.f * qy * qw);
-                    float3 r1 = make_float3(
-                        2.f * qx * qy + 2.f * qz * qw,
-                        1.f - 2.f * qx * qx - 2.f * qz * qz,
-                        2.f * qy * qz - 2.f * qx * qw);
-                    float3 r2 = make_float3(
-                        2.f * qx * qz - 2.f * qy * qw,
-                        2.f * qy * qz + 2.f * qx * qw,
-                        1.f - 2.f * qx * qx - 2.f * qy * qy);
 
-                    float3 rt0 = make_float3(r0.x, r1.x, r2.x);
-                    float3 rt1 = make_float3(r0.y, r1.y, r2.y);
-                    float3 rt2 = make_float3(r0.z, r1.z, r2.z);
-                    // S^{-1}*R^T
-                    float4 m0 = make_float4( 
-                        scale_inv.x * rt0.x, scale_inv.x * rt0.y, scale_inv.x * rt0.z, 0.f);
-                    float4 m1 = make_float4( 
-                        scale_inv.y * rt1.x, scale_inv.y * rt1.y, scale_inv.y * rt1.z, 0.f);
-                    float4 m2 = make_float4( 
-                        scale_inv.z * rt2.x, scale_inv.z * rt2.y, scale_inv.z * rt2.z, 0.f);
+                    // compute kernal response
 
                     float3 pos_local = data->geo.threedgs.pt_positions[particle_index];
                     //todo 还没思路怎么把高斯instance应用localtoworld的transform
                     //思路1：把transfrom矩阵看成一个整体推算
                     //思路2：在Geometry::Threedgs里面把SRT矩阵也加进去
+                    //要不先只加平移
                     float3 pos = pos_local;
 
-                    float3 o_g = optix_impl::optixTransformVector(m0, m1, m2, ray_origin - pos);
-                    float3 d_g = optix_impl::optixTransformVector(m0, m1, m2, ray_direction);
-                    float  t_max_res = (-dot(o_g, d_g)) / dot(d_g, d_g);
-                    float3 pt  = ray_origin + ray_direction * t_max_res;
+                    float3 scale = data->geo.threedgs.scales[particle_index] *
+                        optix_launch_params.config.scale_factor;
+                    float3 scale_inv = 1.f / scale;
+                    mat3x3 Sinv = make_mat3x3(scale_inv);
 
-                    //R * S-1 * S-1
-                    float3 t0 = make_float3(
-                        r0.x * scale_inv.x * scale_inv.x, 
-                        r0.x * scale_inv.y * scale_inv.y, 
-                        r0.x * scale_inv.z * scale_inv.z);
-                    float3 t1 = make_float3(
-                        r1.x * scale_inv.x * scale_inv.x, 
-                        r1.x * scale_inv.y * scale_inv.y, 
-                        r1.x * scale_inv.z * scale_inv.z);
-                    float3 t2 = make_float3(
-                        r2.x * scale_inv.x * scale_inv.x, 
-                        r2.x * scale_inv.y * scale_inv.y, 
-                        r2.x * scale_inv.z * scale_inv.z);
+                    mat3x3 R;
+                    quat2Rot(data->geo.threedgs.rotations[particle_index], R);
+                    mat3x3 RT = transpose(R);
 
-                    // * R^T
-                    m0 = make_float4(
-                        t0.x * rt0.x + t0.y * rt1.x + t0.z * rt2.x,
-                        t0.x * rt0.y + t0.y * rt1.y + t0.z * rt2.y,
-                        t0.x * rt0.z + t0.y * rt1.z + t0.z * rt2.z,
-                        0.f);
-                    m1 = make_float4(
-                        t1.x * rt0.x + t1.y * rt1.x + t1.z * rt2.x,
-                        t1.x * rt0.y + t1.y * rt1.y + t1.z * rt2.y,
-                        t1.x * rt0.z + t1.y * rt1.z + t1.z * rt2.z,
-                        0.f);
-                    m2 = make_float4(
-                        t2.x * rt0.x + t2.y * rt1.x + t2.z * rt2.x,
-                        t2.x * rt0.y + t2.y * rt1.y + t2.z * rt2.y,
-                        t2.x * rt0.z + t2.y * rt1.z + t2.z * rt2.z,
-                        0.f);
+                    // Covariance
+                    mat3x3 RSinv2; // R * S-1*S-1
+                    RSinv2.r0 = R.r0 * scale_inv * scale_inv;
+                    RSinv2.r1 = R.r1 * scale_inv * scale_inv;
+                    RSinv2.r2 = R.r2 * scale_inv * scale_inv;
+                    mat3x3 Sigma  = RSinv2 * RT;
 
-                    m0 = make_float4(scale_inv.x * scale_inv.x, 0, 0, 0);
-                    m1 = make_float4(0, scale_inv.y * scale_inv.y, 0, 0);
-                    m2 = make_float4(0, 0, scale_inv.z * scale_inv.z, 0);
-            
+                    // Max response from 3DGRT
+                    mat3x3 SinvRT = Sinv * RT; // S^{-1}*R^T
+                    float3 o_g = SinvRT * (ray_origin - pos);
+                    float3 d_g = SinvRT * ray_direction;
+                    float t_max_res = (-dot(o_g, d_g)) / dot(d_g, d_g);
+                    float3 pt = ray_origin + ray_direction * t_max_res;
+    
                     float3 x_minus_mu = pt - pos;
-                    float3 temp = optix_impl::optixTransformVector(m0, m1, m2, x_minus_mu);
+                    float3 temp = Sigma * x_minus_mu;
                     float  power = -dot(x_minus_mu, temp);
+
+                    //todo 原版3DGS投影方式
+                    //float4 p_hom = optix_launch_params.projection_matrix * make_float4(pos, 1.f);
+                    //float  p_w   = 1.f / (p_hom.w + 0.0000001f);
+                    //float3 p_proj = make_float3(p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w);
+                    // computeCov2D
+
+
                     float alpha_hit = min(0.99f, 
                         expf(power) * data->geo.threedgs.opacities[particle_index]);
 
@@ -353,10 +333,6 @@ extern "C" __global__ void __raygen__main() {
                         radiance_gaussian += transmittance * alpha_hit * radiance_hit;
                         transmittance *= (1 - alpha_hit);
                     }
-                    //测试每个包围体第一个顶点位置
-                    //uint3 idx = data->geo.threedgs.indices[particle_index*20];
-                    //pos = data->geo.threedgs.positions[idx.x];
-            
                     //测试中心点是否在包围体中心
                     //float t_close = dot(ray_direction, pos - ray_origin) / dot(ray_direction, ray_direction);
                     //float3 p_close  = ray_origin + ray_direction * t_close;

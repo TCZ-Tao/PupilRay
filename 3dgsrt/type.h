@@ -29,6 +29,7 @@ struct OptixLaunchParams {
 
     cuda::ConstDataView<optix::Camera> camera;
     optix::EmitterGroup emitters;
+    mat4x4 projection_matrix;
 
     cuda::RWArrayView<float4> accum_buffer;
     cuda::RWArrayView<float4> frame_buffer;

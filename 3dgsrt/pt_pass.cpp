@@ -49,6 +49,8 @@ void PTPass::OnRun() noexcept {
         m_optix_launch_params.emitters = m_world->emitters->GetEmitterGroup();
         m_dirty = false;
     }
+    // 因为获取不到camera dirty状态，暂时每帧都更新一次
+    m_optix_launch_params.projection_matrix = ToCudaType(m_world_camera->GetProjectionMatrix());
 
     m_optix_pass->Run(m_optix_launch_params, m_optix_launch_params.config.frame.width,
                       m_optix_launch_params.config.frame.height);
