@@ -26,6 +26,7 @@ struct OptixLaunchParams {
     } config;
     unsigned int random_seed;
     unsigned int sample_cnt;
+    float4       fov;
 
     cuda::ConstDataView<optix::Camera> camera;
     optix::EmitterGroup emitters;

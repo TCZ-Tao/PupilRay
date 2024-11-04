@@ -40,6 +40,9 @@ PTPass::PTPass(std::string_view name) noexcept
 void PTPass::OnRun() noexcept {
     if (m_dirty) {
         m_optix_launch_params.camera.SetData(m_world_camera->GetCudaMemory());
+        // 因为获取不到camera dirty状态，暂时每帧都更新一次
+        m_optix_launch_params.projection_matrix = ToCudaType(m_world_camera->GetProjectionMatrix());
+
         m_optix_launch_params.config.max_depth = m_max_depth;
         m_optix_launch_params.config.scale_factor = m_scale_factor;
         m_optix_launch_params.config.accumulated_flag = m_accumulated_flag;
@@ -49,8 +52,6 @@ void PTPass::OnRun() noexcept {
         m_optix_launch_params.emitters = m_world->emitters->GetEmitterGroup();
         m_dirty = false;
     }
-    // 因为获取不到camera dirty状态，暂时每帧都更新一次
-    m_optix_launch_params.projection_matrix = ToCudaType(m_world_camera->GetProjectionMatrix());
 
     m_optix_pass->Run(m_optix_launch_params, m_optix_launch_params.config.frame.width,
                       m_optix_launch_params.config.frame.height);
@@ -143,6 +144,13 @@ void PTPass::SetScene(world::World *world) noexcept {
     m_optix_launch_params.config.max_depth = world->scene->integrator.max_depth;
     m_optix_launch_params.config.scale_factor     = 1.f;
     m_optix_launch_params.config.accumulated_flag = true;
+
+    auto cam_desc = m_world_camera->GetDesc();
+    m_optix_launch_params.fov.y = cam_desc.fov_y;
+    float fov_x = 2.f * atanf(tanf(cam_desc.fov_y * 0.5f) * cam_desc.aspect_ratio);
+    m_optix_launch_params.fov.x = fov_x;
+    m_optix_launch_params.fov.z = tanf(fov_x * 0.5f);
+    m_optix_launch_params.fov.w = tanf(cam_desc.fov_y * 0.5f);
 
     m_max_depth = m_optix_launch_params.config.max_depth;
     m_scale_factor = m_optix_launch_params.config.scale_factor;
