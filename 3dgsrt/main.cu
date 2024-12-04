@@ -92,6 +92,8 @@ CUDA_INLINE CUDA_DEVICE float3 ComputeSH(pt::HitGroupData* data,
 
     c += 0.5f;
     if (c.x < 0.f) c.x = 0.f;
+    if (c.y < 0.f) c.y = 0.f;
+    if (c.z < 0.f) c.z = 0.f;
     return c;
 }
 
@@ -101,7 +103,7 @@ CUDA_INLINE CUDA_DEVICE void quat2Rot(const float4 q, mat3x3& R) {
     float x = q.y;
     float y = q.z;
     float z = q.w;
-    R.r0 = make_float3(1.f - 2.f * (y * y - z * z), 2.f * (x * y - z * r), 2.f * (x * z + y * r));
+    R.r0 = make_float3(1.f - 2.f * (y * y + z * z), 2.f * (x * y - z * r), 2.f * (x * z + y * r));
     R.r1 = make_float3(2.f * (x * y + z * r), 1.f - 2.f * (x * x + z * z), 2.f * (y * z - x * r));
     R.r2 = make_float3(2.f * (x * z - y * r), 2.f * (y * z + x * r), 1.f - 2.f * (x * x + y * y));
 }
@@ -109,33 +111,31 @@ CUDA_INLINE CUDA_DEVICE void quat2Rot(const float4 q, mat3x3& R) {
 
 CUDA_INLINE CUDA_DEVICE float3 computeCov2D(const float3 pos, 
     const float focal_x, const float focal_y, const float tan_fovx, const float tan_fovy, 
-    const mat3x3& cov3D, const mat4x4& c2w){
-    // c2w to w2c
-    mat3x3 w2c;
-    w2c.r0 = make_float3(c2w.r0.x, c2w.r0.y, c2w.r0.z); 
-    w2c.r1 = make_float3(c2w.r1.x, c2w.r1.y, c2w.r1.z);
-    w2c.r2 = make_float3(c2w.r2.x, c2w.r2.y, c2w.r2.z);
-
-    float3 t = w2c * pos;
+    const mat3x3& cov3D, const mat4x4& w2c){
+    float4 p_hom = make_float4(pos, 1.f);
+    float3 t = make_float3(w2c * p_hom);
 
     const float limx = 1.3f * tan_fovx;
     const float limy = 1.3f * tan_fovy;
     const float txtz = t.x / t.z;
     const float tytz = t.y / t.z;
-    t.x              = min(limx, max(-limx, txtz)) * t.z;
-    t.y              = min(limy, max(-limy, tytz)) * t.z;
+    t.x = min(limx, max(-limx, txtz)) * t.z;
+    t.y = min(limy, max(-limy, tytz)) * t.z;
 
     mat3x3 J;
+    auto   focal_y_t = focal_y * 1.f;
     J.r0 = make_float3(focal_x/t.z, 0.f, 0.f);
-    J.r1 = make_float3(0.f, focal_y/t.z, 0.f);
-    J.r2 = make_float3(-focal_x*txtz/t.z, -focal_y*tytz/t.z, 0.f);
+    J.r1 = make_float3(0.f, focal_y_t/t.z, 0.f);
+    J.r2 = make_float3(-focal_x*txtz/t.z, -focal_y_t*tytz/t.z, 0.f);
 
-    mat3x3 T = w2c * J;
-    mat3x3 cov2D = transpose(T) * cov3D * T;
+    mat3x3 W = make_mat3x3(w2c.r0.x, w2c.r0.y, w2c.r0.z, 
+        w2c.r1.x, w2c.r1.y, w2c.r1.z, w2c.r2.x, w2c.r2.y, w2c.r2.z);
+    mat3x3 T = J * W;
+    mat3x3 cov2D = T * cov3D * transpose(T);
 
     cov2D.r0.x += 0.3f;
     cov2D.r1.y += 0.3f;
-    return make_float3(cov2D.r0.x, cov2D.r1.y, cov2D.r0.y);
+    return make_float3(cov2D.r0.x, cov2D.r0.y, cov2D.r1.y);
 }
 
 extern "C" __global__ void __raygen__main() {
@@ -145,6 +145,28 @@ extern "C" __global__ void __raygen__main() {
     const unsigned int pixel_index = index.y * w + index.x;
 
     auto &camera = *optix_launch_params.camera.GetDataPtr();
+
+    //mat4x4 c2w = camera.camera_to_world;
+    //mat3x3 cam_R;
+    //cam_R.r0 = make_float3(c2w.r0.x, c2w.r1.x, c2w.r2.x); 
+    //cam_R.r1 = make_float3(c2w.r0.y, c2w.r1.y, c2w.r2.y);
+    //cam_R.r2 = make_float3(c2w.r0.z, c2w.r1.z, c2w.r2.z);
+    //float3 translate_inv = make_float3(-c2w.r0.w, -c2w.r1.w, -c2w.r2.w);
+    //mat4x4 w2c = make_mat4x4(cam_R);
+    //w2c.r0.w = dot(cam_R.r0, translate_inv);
+    //w2c.r1.w = dot(cam_R.r1, translate_inv);
+    //w2c.r2.w = dot(cam_R.r2, translate_inv);
+
+    //mat4x4 full_proj = optix_launch_params.full_proj_matrix;
+
+    mat4x4 w2c = optix_launch_params.view_matrix;
+    //w2c.r1 *= -1.f;
+    //w2c.r2 *= -1.f;
+
+    mat4x4 proj_matrix = optix_launch_params.proj_matrix;
+    mat4x4 full_proj   = proj_matrix * w2c;
+
+    //full_proj.r1 *= -1.f;
 
     PathPayloadRecord record{};
     uint32_t u0, u1;
@@ -192,6 +214,9 @@ extern "C" __global__ void __raygen__main() {
             //        make_float4(record.hit.geo.texcoord.x, record.hit.geo.texcoord.y, 
             //            1.f - record.hit.geo.texcoord.x - record.hit.geo.texcoord.y, 1.f);
             //}
+    const int db_x = 360;
+    const int db_y = 360;
+
     int depth = 0;
     bool reach_bg = false;
     float3 ray_origin_next = ray_origin;
@@ -325,60 +350,106 @@ extern "C" __global__ void __raygen__main() {
 
                     mat3x3 R;
                     quat2Rot(data->geo.threedgs.rotations[particle_index], R);
+                    //R.r1 *= -1.f;
+                    //R.r2 *= -1.f;
                     mat3x3 Rt = transpose(R);
 
-                    // Covariance
+                    //// Covariance
                     mat3x3 RSinv2; // R * S-1*S-1
                     RSinv2.r0 = R.r0 * scale_inv * scale_inv;
                     RSinv2.r1 = R.r1 * scale_inv * scale_inv;
                     RSinv2.r2 = R.r2 * scale_inv * scale_inv;
-                    mat3x3 Sigma  = RSinv2 * Rt;
+                    mat3x3 Sigma_inv  = RSinv2 * Rt;
 
                     // Max response from 3DGRT
-                    //mat3x3 SinvRt = Sinv * Rt; // S^{-1}*R^T
-                    //float3 o_g = SinvRt * (ray_origin - pos);
-                    //float3 d_g = SinvRt * ray_direction;
-                    //float t_max_res = (-dot(o_g, d_g)) / dot(d_g, d_g);
-                    //float3 pt = ray_origin + ray_direction * t_max_res;
+                    mat3x3 SinvRt = Sinv * Rt; // S^{-1}*R^T
+                    float3 o_g = SinvRt * (ray_origin - pos);
+                    float3 d_g = SinvRt * ray_direction;
+                    float t_max_res = (-dot(o_g, d_g)) / dot(d_g, d_g);
+                    float3 pt = ray_origin + ray_direction * t_max_res;
     
-                    //float3 x_minus_mu = pt - pos;
-                    //float3 temp = Sigma * x_minus_mu;
-                    //float  power = -dot(x_minus_mu, temp);
+                    float3 x_minus_mu = pt - pos;
+                    float3 temp = Sigma_inv * x_minus_mu;
+                    float  power = -dot(x_minus_mu, temp);
 
                     //todo 原版3DGS投影方式
-                    float4 p_hom = optix_launch_params.projection_matrix * make_float4(pos, 1.f);
-                    float  p_w   = 1.f / (p_hom.w + 0.0000001f);
-                    float3 p_proj = make_float3(p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w);
-                    float3  cov2D = computeCov2D(pos, fov.x, fov.y, fov.z, fov.w, Sigma, 
-                        camera.camera_to_world);
-                    float  det    = cov2D.x * cov2D.z - cov2D.y * cov2D.y;
-                    float  det_inv = 1.f / det;
-                    float3 conic = make_float3(
-                        cov2D.z * det_inv, -cov2D.y * det_inv, cov2D.x * det_inv);
+                    bool det_zero = true;//方便注释掉切换回3DGRT
 
+                    //// cov3D
+                    //mat3x3 RS2; // R * S*S
+                    //RS2.r0 = R.r0 * scale * scale;
+                    //RS2.r1 = R.r1 * scale * scale;
+                    //RS2.r2 = R.r2 * scale * scale;
+                    //mat3x3 Sigma = RS2 * Rt;
 
-                    float mid = 0.5f * (cov2D.x + cov2D.z);
-                    float lambda1 = mid + sqrt(max(0.1f, mid * mid - det));
-                    float lambda2 = mid - sqrt(max(0.1f, mid * mid - det));
-                    float radius = ceil(3.f * sqrt(max(lambda1, lambda2)));
-                    float2 xy = make_float2(
-                        ((p_proj.x + 1.f) * w - 1.f) * 0.5f,
-                        ((p_proj.y + 1.f) * h - 1.f) * 0.5f);
+                    //// particle position to NDC space
+                    //float4 p_hom = full_proj * make_float4(pos, 1.f);
+                    //float  p_w   = 1.f / (p_hom.w + 0.0000001f);
+                    //float3 p_proj = make_float3(p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w);
 
-                    float2 d = make_float2(xy.x - index.x, xy.y - index.y);
-                    float power = -0.5f * (conic.x * d.x * d.x + conic.z * d.y * d.y) -
-                                  conic.y * d.x * d.y;
+                    //// 2D covariance
+                    //float  focal_x = w / (2.f * fov.z);
+                    //float  focal_y = h / (2.f * fov.w);
+                    //float3  cov2D = computeCov2D(pos, focal_x, focal_y, fov.z, fov.w, Sigma, w2c);
+                    //float det = cov2D.x * cov2D.z - cov2D.y * cov2D.y;
+                    //det_zero = det != 0.f;
+                    //float  det_inv = 1.f / det;
+                    //float3 conic = make_float3(
+                    //    cov2D.z * det_inv, -cov2D.y * det_inv, cov2D.x * det_inv);
+
+                    //float mid = 0.5f * (cov2D.x + cov2D.z);
+                    //float lambda1 = mid + sqrt(max(0.1f, mid * mid - det));
+                    //float lambda2 = mid - sqrt(max(0.1f, mid * mid - det));
+                    //float radius = ceil(3.f * sqrt(max(lambda1, lambda2)));
+                    //float2 xy = make_float2(
+                    //    ((p_proj.x + 1.f) * w - 1.f) * 0.5f,
+                    //    ((p_proj.y + 1.f) * h - 1.f) * 0.5f);
+
+                    //float2 d = make_float2(xy.x - index.x, xy.y - index.y);
+                    //float power = -0.5f * (conic.x * d.x * d.x + conic.z * d.y * d.y) -
+                    //              conic.y * d.x * d.y;
 
                     float alpha_hit = min(0.99f, 
                         expf(power) * data->geo.threedgs.opacities[particle_index]);
 
-                    if (alpha_hit > PLY_3DGS_ALPHA_MIN && det != 0.f) {
+                    if (alpha_hit > PLY_3DGS_ALPHA_MIN && det_zero) {
                         unsigned int index_begin = particle_index * PLY_3DGS_NUM_SHS;
-                        float3 radiance_hit = ComputeSH(data, index_begin, 
-                            ray_direction.x, ray_direction.y, ray_direction.z);
+                        //float3 radiance_hit = ComputeSH(data, index_begin, 
+                        //    ray_direction.x, ray_direction.y, ray_direction.z);
+                        float3 dir = normalize(pos - ray_origin);
+                        float3 radiance_hit = ComputeSH(data, index_begin, dir.x, dir.y, dir.z);
                         radiance_gaussian += transmittance * alpha_hit * radiance_hit;
                         transmittance *= (1 - alpha_hit);
                     }
+                    float3 dir_t = normalize(pos - ray_origin);
+                    float3 radiance_hit_t = ComputeSH(data, 
+                        particle_index * PLY_3DGS_NUM_SHS, dir_t.x, dir_t.y, dir_t.z);
+
+
+                    if (index.x == db_x && index.y == db_y) {
+                        //printf("partical index: %d\n", particle_index);
+                        //printf("scale: %f,%f,%f\n", scale.x, scale.y, scale.z);
+                        //printf("rotation: %f,%f,%f,%f\n", data->geo.threedgs.rotations[particle_index].x,
+                        //    data->geo.threedgs.rotations[particle_index].y,
+                        //    data->geo.threedgs.rotations[particle_index].z,
+                        //    data->geo.threedgs.rotations[particle_index].w);
+                        //printf("R:\n");
+                        //PrintMat3(R);
+                        //printf("Sigma:\n");
+                        //PrintMat3(Sigma);
+                        //printf("pos: %f,%f,%f\n", pos.x, pos.y, pos.z);
+                        //printf("p_hom: %f,%f,%f,%f\n", p_hom.x, p_hom.y, p_hom.z, p_hom.w);
+                        //printf("p_proj: %f,%f,%f,%f\n", p_proj.x, p_proj.y, p_proj.z, p_w);
+                        //printf("fov: %f,%f,%f,%f\n", fov.x, fov.y, fov.z, fov.w);
+                        //printf("cov2D: %f,%f,%f\n", cov2D.x, cov2D.y, cov2D.z);
+                        //printf("conic: %f,%f,%f\n", conic.x, conic.y, conic.z);
+                        //printf("xy: %f,%f\n", xy.x, xy.y);
+                        ////printf("index: %d,%d\n", index.x, index.y);
+                        //printf("d: %f,%f\n", d.x, d.y);
+                        //printf("power: %f\n", power);
+                        //printf("radiance: %f,%f,%f\n", radiance_hit_t.x, radiance_hit_t.y, radiance_hit_t.z);
+                    }
+
                     //测试中心点是否在包围体中心
                     //float t_close = dot(ray_direction, pos - ray_origin) / dot(ray_direction, ray_direction);
                     //float3 p_close  = ray_origin + ray_direction * t_close;
@@ -391,7 +462,7 @@ extern "C" __global__ void __raygen__main() {
                 // visualize test
                 //optix_launch_params.albedo_buffer[pixel_index] = 
                 //    make_float3((float)hit_count/PLY_3DGS_CHUNK_SIZE);
-                ++ray_count;
+                //++ray_count;
 
                 // if not enough, it's tmax. if the queue is full, use the furthest one
                 t_curr = record.queue.hit_t[PLY_3DGS_CHUNK_SIZE-1];
